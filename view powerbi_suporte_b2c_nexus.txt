@@ -1,0 +1,286 @@
+WITH NEXUS_MATCH AS (
+    -- Replica a busca/dedup da POWERBI_DEPENDENCIA_NEXUS contra TB_REGRA_MAGIC_NEXUS,
+    -- mas usando o mesmo filtro de janela da POWERBI_SUPORTE_B2C_NEXUS (sem os filtros
+    -- adicionais SOLUCAO IS NOT NULL / PROBLEMA NOT LIKE '%Queda Ligação%' da dependencia),
+    -- para não descartar linhas que existem aqui e não existem lá.
+    SELECT *
+    FROM (
+        SELECT
+            B2C.ID_TABULACAO,
+            B2C.ATIVIDADE,
+            B2C.TIPO AS TIPO_RAW,
+            NEXUS.REGRA,
+
+            CASE
+                WHEN NEXUS.REGRA = 'Beatrix'
+                     AND (B2C.CRM <> 'NEXT' OR B2C.TIPO_OS NOT IN ('Instalação', 'Alteração'))
+                THEN 'Sem Funcionalidade'
+                ELSE NVL(NEXUS.FUNCIONALIDADE, 'Sem Funcionalidade')
+            END AS API,
+
+            -- >>> MANUTENCAO -- DESEMPATE BEATRIX CONDICIONAL (NAO REVERTER) <<<
+            -- Mesma correcao aplicada na POWERBI_DEPENDENCIA_NEXUS e na
+            -- POWERBI_USABILIDADE_MAGIC_CHAMADOS (diagnostico com o analista,
+            -- 2026-07, validado com 20 atividades reais): quando PRODUTO+
+            -- DEFEITO+PROBLEMA bate em DUAS regras (uma Beatrix, uma nao-
+            -- Beatrix), o desempate antigo sempre preferia Beatrix mesmo
+            -- quando a atividade nao era elegivel (CRM<>NEXT ou TIPO_OS fora
+            -- de Instalacao/Alteracao) -- o filtro de elegibilidade so
+            -- reprova DEPOIS do desempate, entao o resultado virava "Sem
+            -- Funcionalidade" em vez de cair na regra nao-Beatrix valida.
+            ROW_NUMBER() OVER (
+                PARTITION BY B2C.ID_TABULACAO
+                ORDER BY
+                    CASE WHEN NEXUS.FUNCIONALIDADE IS NOT NULL THEN 1 ELSE 2 END,
+                    CASE
+                        WHEN B2C.CRM = 'NEXT' AND B2C.TIPO_OS IN ('Instalação', 'Alteração') THEN
+                            CASE WHEN NEXUS.REGRA = 'Beatrix' THEN 1 ELSE 2 END
+                        ELSE
+                            CASE WHEN NEXUS.REGRA = 'Beatrix' THEN 2 ELSE 1 END
+                    END,
+                    NEXUS.FUNCIONALIDADE,
+                    NEXUS.REGRA
+            ) AS RN
+
+        FROM
+            PORTALINTEGRA_TABULADOR_B2C B2C
+
+        LEFT JOIN TB_REGRA_MAGIC_NEXUS NEXUS
+            ON B2C.PRODUTO = NEXUS.PRODUTO
+           AND B2C.DEFEITO = NEXUS.DEFEITO_RECLAMADO
+           AND B2C.PROBLEMA = NEXUS.PROBLEMA_ENCONTRADO
+
+        WHERE
+            B2C.DATA_INICIO >= TRUNC(ADD_MONTHS(SYSDATE, -6), 'MM')
+            AND B2C.DATA_INICIO >= TO_DATE('01-10-2025', 'DD/MM/YYYY')
+            AND B2C.VALIDADO = 1
+    )
+    WHERE RN = 1
+),
+
+MAGIC_DEDUP AS (
+    -- usada para checar se a funcionalidade usada bate com a esperada
+    --
+    -- >>> MANUTENCAO -- DEDUP POR FAMILIA, NAO SO POR FUNCIONALIDADE (NAO REVERTER) <<<
+    -- Antes deduplicava so por (ACTIVITY_ID, FUNCIONALIDADE) bruto. Como o
+    -- JOIN em BASE_DEPENDENCIA compara pela FAMILIA normalizada (carga-psa
+    -- e checklist-vlan viram o mesmo valor "config-rede"), uma atividade
+    -- que usou AS DUAS ferramentas da familia batia 2x no join (uma linha
+    -- por ferramenta), duplicando ID_TABULACAO na saida. Corrigido
+    -- dedupando ja pela familia aqui -- no maximo 1 linha por (ACTIVITY_ID,
+    -- familia), join volta a ser 1:1.
+    SELECT DISTINCT
+        ACTIVITY_ID,
+        CASE WHEN TRIM(LOWER(FUNCIONALIDADE)) IN ('carga-psa', 'checklist-vlan')
+             THEN 'config-rede' ELSE TRIM(LOWER(FUNCIONALIDADE)) END AS FAMILIA
+    FROM B2C_SUPORTE_MAGIC_M
+),
+
+MAGIC_ANY AS (
+    -- usada só para checar se houve QUALQUER uso do Magic naquela atividade
+    SELECT DISTINCT
+        ACTIVITY_ID
+    FROM B2C_SUPORTE_MAGIC_M
+),
+
+BASE_DEPENDENCIA AS (
+    SELECT
+        NX.ID_TABULACAO,
+        NX.API,
+
+        CASE
+            WHEN LOWER(NX.API) = 'checklist-vlan' THEN 'Configuração de Rede'
+            WHEN LOWER(NX.API) = 'carga-psa' THEN 'Configuração de Rede'
+            WHEN LOWER(NX.API) = 'iptv' THEN 'Reenvio Pacotes'
+            WHEN LOWER(NX.API) = 'manobra' THEN 'Manobra'
+            WHEN LOWER(NX.API) = 'fxs' THEN 'Reenvio FXS'
+            ELSE NX.API
+        END AS FUNCIONALIDADE,
+
+        CASE
+            WHEN NX.REGRA = 'Beatrix'
+                 AND NX.API = 'Sem Funcionalidade'
+            THEN 'DEVIDO'
+            ELSE NX.TIPO_RAW
+        END AS TIPO_ORIGINAL,
+
+        CASE
+            WHEN NX.API = 'Sem Funcionalidade' THEN '-'
+            WHEN MAGIC_EXATO.ACTIVITY_ID IS NOT NULL THEN 'Correto'
+            WHEN MAGIC_QQ.ACTIVITY_ID IS NOT NULL THEN 'Usou Errado'
+            ELSE 'Não Usou'
+        END AS USO_API_CORRETA
+
+    FROM NEXUS_MATCH NX
+
+    -- >>> MANUTENCAO -- NAO REVERTER PRA "NX.API = MAGIC_EXATO.FUNCIONALIDADE" <<<
+    -- Mesma correcao aplicada na POWERBI_DEPENDENCIA_NEXUS e na
+    --   1) TRIM(LOWER()) dos dois lados -- a regra grava "Manobra" com
+    --      maiuscula, o log do Magic grava "manobra" minusculo; o "=" exato
+    --      nunca casava (falso "Nao"/"Usou Errado").
+    --   2) carga-psa e checklist-vlan tratados como equivalentes -- a view
+    --      ja agrupa as duas como "Configuracao de Rede" logo acima, mas o
+    --      join original exigia a MESMA ferramenta especifica da regra.
+
+    LEFT JOIN MAGIC_DEDUP MAGIC_EXATO
+        ON NX.ATIVIDADE = MAGIC_EXATO.ACTIVITY_ID
+       AND CASE WHEN TRIM(LOWER(NX.API)) IN ('carga-psa', 'checklist-vlan')
+                THEN 'config-rede' ELSE TRIM(LOWER(NX.API)) END
+         = MAGIC_EXATO.FAMILIA
+
+    LEFT JOIN MAGIC_ANY MAGIC_QQ
+        ON NX.ATIVIDADE = MAGIC_QQ.ACTIVITY_ID
+)
+
+SELECT
+    B2C.ID_TABULACAO,
+    B2C.MATRICULA_OPERADOR,
+    B2C.DATA_INICIO,
+    B2C.DATA_FIM,
+    B2C.CHAMADO,
+    B2C.TIPO_TROCA,
+    B2C.ID_GPS,
+    B2C.ATIVIDADE,
+    B2C.ID_CADASTRO,
+    B2C.PON,
+    B2C.OLT,
+    B2C.REDE,
+    B2C.CRM,
+    B2C.SLID,
+    B2C.SLOT,
+    B2C.PORTA,
+    B2C.CABO,
+    B2C.PRIMARIA,
+    B2C.BANDA_DESIGNADOR,
+    B2C.BANDA_IP_FIXO,
+    B2C.TV_DESIGNADOR,
+    B2C.TV_PACOTE,
+    B2C.VOZ_DESIGNADOR,
+    B2C.SPLITTER,
+    B2C.AREA_TELEFONICA,
+    B2C.CNL,
+    B2C.DESIGNADOR_ACESSO,
+    B2C.INSTANCIAS,
+    B2C.AREA_GEOGRAFICA,
+    B2C.AREA_BLACKOUT,
+    B2C.TV_DISPOSITIVOS,
+    B2C.ID,
+    B2C.CLIENTE_ANATEL,
+    B2C.STATUS_MAX,
+    CASE 
+        WHEN LENGTH(TRIM(B2C.INSTANCIAS)) > 10
+             AND B2C.PRODUTO = 'Voz'
+        THEN 'ATA'
+        ELSE B2C.PRODUTO 
+    END AS PRODUTO,
+    B2C.DEFEITO,
+    B2C.PROBLEMA,
+    B2C.SOLUCAO,
+    INITCAP(
+        CASE
+            WHEN B2C.DATA_INICIO < TO_DATE('12/11/2025', 'DD/MM/YYYY') THEN NULL
+            WHEN B2C.TIPO IS NULL THEN 'INDEFINIDO'
+            WHEN B2C.SOLUCAO IN ('Queda de Ligação', 'Queda Ligação') THEN 'IMPRODUTIVO'
+            ELSE B2C.TIPO
+        END
+    ) AS TIPO,
+    CASE
+        WHEN B2C.DATA_FIM = MAX(B2C.DATA_FIM) OVER (PARTITION BY B2C.ATIVIDADE)
+        THEN 'Resolvido'
+        ELSE 'Rechamou'
+    END AS RESOLUCAO,
+    -- Colunas adicionais da tabela COLABORADORES
+    CASE
+        WHEN CLB.AREA_ATUACAO = 'SUPORTE TEL' THEN 'TEL'
+        WHEN CLB.CIDADE = 'SAO PAULO' THEN 'SPO'
+        WHEN CLB.CIDADE = 'CURITIBA' THEN 'CTA'
+        ELSE CLB.CIDADE
+    END AS CO,
+
+    INITCAP(CLB.COLABORADOR) AS COLABORADOR,
+
+    INITCAP(
+      TRIM(
+        CASE
+          WHEN CLB.SUPERIOR_IMEDIATO LIKE '% CO'
+            THEN SUBSTR(CLB.SUPERIOR_IMEDIATO, 1, LENGTH(CLB.SUPERIOR_IMEDIATO) - 3)
+          ELSE CLB.SUPERIOR_IMEDIATO
+        END
+      )
+    ) AS SUPERIOR_IMEDIATO,
+
+    INITCAP(
+      TRIM(
+        CASE
+          WHEN CLB.COORDENACAO LIKE '% CO'
+            THEN SUBSTR(CLB.COORDENACAO, 1, LENGTH(CLB.COORDENACAO) - 3)
+          ELSE CLB.COORDENACAO
+        END
+      )
+    ) AS COORDENACAO,
+
+    INITCAP(
+      TRIM(
+        CASE
+          WHEN CLB.GERENCIA LIKE '% CO'
+            THEN SUBSTR(CLB.GERENCIA, 1, LENGTH(CLB.GERENCIA) - 3)
+          ELSE CLB.GERENCIA
+        END
+      )
+    ) AS GERENCIA,
+
+    CLB.AREA_ATUACAO,
+    CLB.TIPO_DE_CARGO,
+    CLB.TIPO_OPERACAO,
+    LOWER(CLB.EMAIL) AS EMAIL,
+    -- Colunas adicionais da tabela LOCALIDADE
+    LOC.REGIONAL,
+    LOC.CLUSTER_,
+    LOC.UF_,
+    LOC.CIDADE,
+    LOC.LOCALIDADE_DETAIL,
+    LOC.AT_NOME,
+
+    -- Colunas trazidas da POWERBI_DEPENDENCIA_NEXUS (mesma lógica de busca)
+    DEP.API,
+    DEP.FUNCIONALIDADE,
+    DEP.USO_API_CORRETA,
+
+    CASE
+        WHEN DEP.TIPO_ORIGINAL IS NOT NULL AND DEP.USO_API_CORRETA = 'Correto' THEN 'DEVIDO'
+        WHEN DEP.TIPO_ORIGINAL IS NOT NULL AND DEP.USO_API_CORRETA IN ('Usou Errado', 'Não Usou') THEN 'INDEVIDO'
+        ELSE DEP.TIPO_ORIGINAL
+    END AS TIPO_DEPENDENCIA,
+
+    -- Regra de negócio da POWERBI_DEPENDENCIA_NEXUS, exposta como flag em vez de filtro
+    -- silencioso: 1 = a linha entraria no universo filtrado da dependencia
+    -- (SOLUCAO IS NOT NULL e PROBLEMA NOT LIKE '%Queda Ligação%'); 0 = não entraria.
+    CASE
+        WHEN B2C.SOLUCAO IS NOT NULL
+             AND B2C.PROBLEMA NOT LIKE '%Queda Ligação%'
+        THEN 1
+        ELSE 0
+    END AS REGRA_NEGOCIO_DEPENDENCIA
+
+FROM
+    PORTALINTEGRA_TABULADOR_B2C B2C
+LEFT JOIN
+    ANALYT_COLABORADORES_HIST CLB
+    ON (B2C.MATRICULA_OPERADOR || TO_CHAR(B2C.DATA_INICIO, 'YYYYMM')) =
+       (CLB.MATRICULA_ANTIGA   || CLB.ANOMES)
+LEFT JOIN
+    DE_PARA_LOCALIDADE LOC
+    ON TRIM(LOC.CNL_AT) = CASE
+                       WHEN SUBSTR(B2C.CNL, 1, 1) = '1'
+                       THEN B2C.CNL || '_' || B2C.AREA_TELEFONICA
+                       ELSE B2C.CNL
+                    END
+LEFT JOIN
+    BASE_DEPENDENCIA DEP
+    ON DEP.ID_TABULACAO = B2C.ID_TABULACAO
+WHERE
+    B2C.DATA_INICIO >= TRUNC(ADD_MONTHS(SYSDATE, -6), 'MM')
+    AND B2C.DATA_INICIO >= TO_DATE('01-10-2025', 'DD/MM/YYYY')
+    AND B2C.VALIDADO = 1
+ORDER BY
+    B2C.DATA_INICIO ASC

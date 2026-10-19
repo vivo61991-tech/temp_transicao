@@ -1,0 +1,317 @@
+WITH CONSULTA_BASE AS (
+    SELECT *
+    FROM (
+        SELECT
+            B2C.ATIVIDADE,
+            B2C.ID_TABULACAO,
+            B2C.DATA_INICIO,
+            B2C.DATA_FIM,
+            B2C.PRODUTO,
+            B2C.DEFEITO,
+            B2C.PROBLEMA,
+            B2C.SOLUCAO,
+            B2C.TIPO,
+            B2C.CRM,
+            B2C.TIPO_OS,
+            NEXUS.REGRA,
+
+            CASE
+                WHEN NEXUS.REGRA = 'Beatrix'
+                     AND (
+                         B2C.CRM <> 'NEXT'
+                         OR B2C.TIPO_OS NOT IN ('Instalação', 'Alteração')
+                     )
+                THEN 'Sem Funcionalidade'
+                ELSE NVL(NEXUS.FUNCIONALIDADE, 'Sem Funcionalidade')
+            END AS API,
+
+            ROW_NUMBER() OVER (
+                PARTITION BY B2C.ID_TABULACAO
+                ORDER BY
+                    CASE WHEN NEXUS.FUNCIONALIDADE IS NOT NULL THEN 1 ELSE 2 END,
+                    CASE WHEN NEXUS.REGRA = 'Beatrix' THEN 1 ELSE 2 END,
+                    NEXUS.FUNCIONALIDADE,
+                    NEXUS.REGRA
+            ) AS RN
+
+        FROM PORTALINTEGRA_TABULADOR_B2C B2C
+
+        LEFT JOIN TB_REGRA_MAGIC_NEXUS NEXUS
+            ON B2C.PRODUTO = NEXUS.PRODUTO
+           AND B2C.DEFEITO = NEXUS.DEFEITO_RECLAMADO
+           AND B2C.PROBLEMA = NEXUS.PROBLEMA_ENCONTRADO
+
+        WHERE
+            B2C.DATA_INICIO >= TRUNC(ADD_MONTHS(SYSDATE, -6), 'MM')
+            AND B2C.DATA_INICIO >= DATE '2025-10-01'
+            AND B2C.VALIDADO = 1
+            AND B2C.SOLUCAO IS NOT NULL
+            AND B2C.PROBLEMA NOT IN(
+                                'Queda de ligação', 
+                                'Atendente não concluiu registro',
+                                'Queda Ligação Durante Atendimento'
+                                )
+    )
+    WHERE RN = 1
+),
+
+/* Menor data da funcionalidade utilizada na atividade */
+MAGIC_DEDUP AS (
+    SELECT
+        ACTIVITY_ID,
+        FUNCIONALIDADE,
+        MIN(DT_INICIO - INTERVAL '3' HOUR) AS DT_INICIO
+    FROM B2C_SUPORTE_MAGIC_M
+    GROUP BY
+        ACTIVITY_ID,
+        FUNCIONALIDADE
+),
+
+/* Utilizado apenas para validar se a atividade existe */
+MAGIC_ATIVIDADE AS (
+    SELECT DISTINCT
+        ACTIVITY_ID
+    FROM B2C_SUPORTE_MAGIC_M
+),
+
+/* Deduplicação da BI_ETA_DIRECT para evitar duplicidade */
+ETA_DIRECT AS (
+    SELECT
+        GA_AID,
+        GA_EXTERNAL_ID,
+        GA_PNAME,
+        GA_XR_COMPANY_NAME,
+        GA_XA_CNL,
+        GA_XA_AT
+    FROM (
+        SELECT
+            GA_AID,
+            GA_EXTERNAL_ID,
+            GA_PNAME,
+            GA_XR_COMPANY_NAME,
+            GA_XA_CNL,
+            GA_XA_AT,
+            ROW_NUMBER() OVER (
+                PARTITION BY GA_AID
+                ORDER BY GA_AID
+            ) RN
+        FROM BI_ETA_DIRECT
+    )
+    WHERE RN = 1
+),
+
+/* Deduplicação da ANALYT_REGIONAIS para evitar duplicidade */
+REGIONAIS AS (
+    SELECT
+        CNL_AT,
+        REGIONAIS,
+        CLUSTER_COM_ACENTUACAO,
+        REGIONAIS_SIGLA,
+        UF_SIGLA,
+        ESTADOS_COM_ACENTUACAO,
+        CIDADES_COM_ACENTUACAO,
+        CLUSTER_LATITUDE,
+        CLUSTER_LONGITUDE
+    FROM (
+        SELECT
+            CNL_AT,
+            REGIONAIS,
+            CLUSTER_COM_ACENTUACAO,
+            REGIONAIS_SIGLA,
+            UF_SIGLA,
+            ESTADOS_COM_ACENTUACAO,
+            CIDADES_COM_ACENTUACAO,
+            CLUSTER_LATITUDE,
+            CLUSTER_LONGITUDE,
+            ROW_NUMBER() OVER (
+                PARTITION BY CNL_AT
+                ORDER BY CNL_AT
+            ) RN
+        FROM ANALYT_REGIONAIS
+    )
+    WHERE RN = 1
+),
+
+CONSULTA_INTERMEDIARIA AS (
+    SELECT
+        BASE.ATIVIDADE,
+        BASE.ID_TABULACAO,
+        BASE.DATA_INICIO,
+        BASE.DATA_FIM,
+        MAGIC.DT_INICIO AS DT_INICIO_MAGIC,
+        BASE.PRODUTO,
+        BASE.DEFEITO,
+        BASE.PROBLEMA,
+        BASE.SOLUCAO,
+        LOWER(BASE.API) AS API,
+        BASE.CRM,
+        BASE.TIPO_OS,
+
+        CASE
+            WHEN LOWER(BASE.API) = 'checklist-vlan' THEN 'Configuração de Rede'
+            WHEN LOWER(BASE.API) = 'carga-psa' THEN 'Configuração de Rede'
+            WHEN LOWER(BASE.API) = 'iptv' THEN 'Reenvio Pacotes'
+            WHEN LOWER(BASE.API) = 'manobra' THEN 'Manobra'
+            WHEN LOWER(BASE.API) = 'fxs' THEN 'Reenvio FXS'
+            ELSE BASE.API
+        END AS FUNCIONALIDADE,
+
+        CASE
+            WHEN BASE.REGRA = 'Beatrix'
+                 AND BASE.API = 'Sem Funcionalidade'
+            THEN 'DEVIDO'
+            ELSE BASE.TIPO
+        END AS TIPO_ORIGINAL,
+
+        CASE
+            WHEN BASE.API = 'Sem Funcionalidade'
+            THEN '-'
+
+            WHEN MAGIC.ACTIVITY_ID IS NOT NULL
+                 AND BASE.DATA_INICIO >= MAGIC.DT_INICIO
+            THEN 'Sim'
+
+            WHEN MAGIC.ACTIVITY_ID IS NOT NULL
+                 AND BASE.DATA_INICIO < MAGIC.DT_INICIO
+            THEN 'Utilizado Depois'
+
+            WHEN MAGIC_ATIV.ACTIVITY_ID IS NOT NULL
+            THEN 'Uso Incorreto'
+
+            ELSE 'Não'
+        END AS FUNCIONALIDADE_MAGIC
+
+    FROM CONSULTA_BASE BASE
+
+    LEFT JOIN MAGIC_DEDUP MAGIC
+        ON BASE.ATIVIDADE = MAGIC.ACTIVITY_ID
+       AND LOWER(BASE.API) = MAGIC.FUNCIONALIDADE
+
+    LEFT JOIN MAGIC_ATIVIDADE MAGIC_ATIV
+        ON BASE.ATIVIDADE = MAGIC_ATIV.ACTIVITY_ID
+)
+
+SELECT
+    INT.ATIVIDADE,
+    INT.ID_TABULACAO,
+    INT.DATA_INICIO,
+    INT.DATA_FIM,
+    INT.DT_INICIO_MAGIC,
+    INT.PRODUTO,
+    INT.DEFEITO,
+    INT.PROBLEMA,
+    INT.SOLUCAO,
+    INT.API,
+    INT.FUNCIONALIDADE,
+    INT.FUNCIONALIDADE_MAGIC,
+    INT.CRM,
+    INT.TIPO_OS,
+
+    ETA.GA_EXTERNAL_ID      AS MATRICULA,
+    ETA.GA_PNAME            AS TECNICO,
+    ETA.GA_XR_COMPANY_NAME  AS CONTRATO,
+    ETA.GA_XA_CNL           AS CNL,
+    ETA.GA_XA_AT            AS AT,
+
+    REG.REGIONAIS              AS REGIONAL,
+    REG.CLUSTER_COM_ACENTUACAO AS CLUSTER_,
+    REG.REGIONAIS_SIGLA        AS REGIONAL_ACRONIMO,
+    REG.UF_SIGLA               AS UF_,
+    REG.ESTADOS_COM_ACENTUACAO AS ESTADO,
+    REG.CIDADES_COM_ACENTUACAO AS CIDADE,
+    REG.CLUSTER_LATITUDE,
+    REG.CLUSTER_LONGITUDE,
+
+    CASE
+        WHEN INT.TIPO_ORIGINAL IS NOT NULL
+             AND INT.FUNCIONALIDADE_MAGIC = 'Sim'
+        THEN 'DEVIDO'
+
+        WHEN INT.TIPO_ORIGINAL IS NOT NULL
+             AND INT.FUNCIONALIDADE_MAGIC IN (
+                 'Não',
+                 'Uso Incorreto',
+                 'Utilizado Depois'
+             )
+        THEN 'INDEVIDO'
+
+        ELSE INT.TIPO_ORIGINAL
+    END AS TIPO,
+
+    CASE
+        WHEN INT.FUNCIONALIDADE_MAGIC IN( 
+                'Não',
+                'Uso Incorreto', 
+                'Utilizado Depois'
+            )
+        THEN 'Indevido Uso MagicTool'
+
+        WHEN (
+            CASE
+                WHEN INT.TIPO_ORIGINAL IS NOT NULL
+                     AND INT.FUNCIONALIDADE_MAGIC = 'Sim'
+                THEN 'DEVIDO'
+
+                WHEN INT.TIPO_ORIGINAL IS NOT NULL
+                     AND INT.FUNCIONALIDADE_MAGIC IN (
+                         'Não',
+                         'Uso Incorreto',
+                         'Utilizado Depois'
+                     )
+                THEN 'INDEVIDO'
+
+                ELSE INT.TIPO_ORIGINAL
+            END
+        ) = 'INDEVIDO'
+        THEN 'Indevido Processos Campo'
+
+        WHEN (
+            CASE
+                WHEN INT.TIPO_ORIGINAL IS NOT NULL
+                     AND INT.FUNCIONALIDADE_MAGIC = 'Sim'
+                THEN 'DEVIDO'
+
+                WHEN INT.TIPO_ORIGINAL IS NOT NULL
+                     AND INT.FUNCIONALIDADE_MAGIC IN (
+                         'Não',
+                         'Uso Incorreto',
+                         'Utilizado Depois'
+                     )
+                THEN 'INDEVIDO'
+
+                ELSE INT.TIPO_ORIGINAL
+            END
+        ) = 'DEVIDO'
+        THEN 'Devido Suporte'
+
+        WHEN INT.TIPO_ORIGINAL IS NULL
+        THEN NULL
+    END AS CATEGORIA,
+    CASE
+        WHEN INT.FUNCIONALIDADE_MAGIC = 'Não'
+        THEN 'MagicTool - Nenhuma API Executada'
+    
+        WHEN INT.FUNCIONALIDADE_MAGIC = 'Uso Incorreto'
+        THEN 'API Incorreta - ' || INT.API || ' Não Executada'
+    
+        WHEN INT.FUNCIONALIDADE_MAGIC = 'Utilizado Depois'
+        THEN 'API ' || INT.API || ' Executada Após Atendimento'
+    
+        ELSE INT.SOLUCAO
+    END AS CATEGORIA_DETALHE
+
+FROM CONSULTA_INTERMEDIARIA INT
+
+LEFT JOIN ETA_DIRECT ETA
+    ON INT.ATIVIDADE = ETA.GA_AID
+
+LEFT JOIN REGIONAIS REG
+    ON REG.CNL_AT =
+           CASE
+               WHEN ETA.GA_XA_CNL LIKE '1%'
+                    AND ETA.GA_XA_CNL || ETA.GA_XA_AT <> '11041'
+               THEN ETA.GA_XA_CNL || '_' || ETA.GA_XA_AT
+               ELSE ETA.GA_XA_CNL
+           END
+
+ORDER BY INT.ID_TABULACAO DESC;
