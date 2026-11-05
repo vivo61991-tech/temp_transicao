@@ -1,0 +1,10 @@
+Devido Suporte	Devido Suporte	7495	1271053	-	-
+Indevido Processos Campo	Indevido Processos Campo	5772	1271050	-	-
+Indevido Uso MagicTool	Indevido Uso MagicTool	2915	1271049	Não	Não
+Devido Suporte	Improdutivo	1182	1271062	-	-
+Indevido Processos Campo	Improdutivo	877	1271048	-	-
+Devido Suporte	Indevido Processos Campo	635	1271047	-	-
+Indevido Processos Campo	Indevido Uso MagicTool	371	1271078	-	Não
+(vazio)	Indefinido	223	1271083	-	-
+Devido Suporte	Indevido Uso MagicTool	12	1271105	Sim	Não Aguardou Tempo Mínimo
+Indevido Processos Campo	Devido Suporte	10	1271443	-	Sim
